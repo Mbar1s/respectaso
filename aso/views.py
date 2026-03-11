@@ -51,9 +51,36 @@ def dashboard_view(request):
     # --- History table (latest result per keyword+country) ---
     app_id = request.GET.get("app")
     country_filter = request.GET.get("country", "")
+    sort_by = request.GET.get("sort", "date")
+    sort_dir = request.GET.get("dir", "desc")
+
+    valid_sort_fields = {
+        "keyword",
+        "rank",
+        "popularity",
+        "difficulty",
+        "country",
+        "competitors",
+        "date",
+    }
+    if sort_by not in valid_sort_fields:
+        sort_by = "date"
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
+
+    # Show rank column when filtering by an app that has a track_id
+    show_rank = False
+    selected_app_name = None
+    if app_id:
+        selected_app_obj = App.objects.filter(id=app_id).first()
+        if selected_app_obj:
+            selected_app_name = selected_app_obj.name
+            if selected_app_obj.track_id:
+                show_rank = True
 
     # Get the latest result ID for each keyword+country pair
-    from django.db.models import Max
+    from django.db.models import Case, IntegerField, Max, Value, When
+    from django.db.models.functions import Lower
 
     latest_filter = {}
     if app_id:
@@ -86,8 +113,59 @@ def dashboard_view(request):
         SearchResult.objects
         .filter(id__in=latest_ids)
         .select_related("keyword", "keyword__app")
-        .order_by("-searched_at")
     )
+
+    sorted_results = None
+
+    if sort_by == "keyword":
+        keyword_order = Lower("keyword__keyword")
+        results_qs = results_qs.order_by(
+            keyword_order.asc() if sort_dir == "asc" else keyword_order.desc(),
+            "-searched_at",
+        )
+    elif sort_by == "rank":
+        if show_rank:
+            rank_is_null = Case(
+                When(app_rank__isnull=True, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            )
+            rank_order = "app_rank" if sort_dir == "asc" else "-app_rank"
+            results_qs = results_qs.order_by(rank_is_null, rank_order, "-searched_at")
+        else:
+            sort_by = "date"
+            sort_dir = "desc"
+            results_qs = results_qs.order_by("-searched_at")
+    elif sort_by == "popularity":
+        popularity_is_null = Case(
+            When(popularity_score__isnull=True, then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        )
+        popularity_order = "popularity_score" if sort_dir == "asc" else "-popularity_score"
+        results_qs = results_qs.order_by(popularity_is_null, popularity_order, "-searched_at")
+    elif sort_by == "difficulty":
+        difficulty_order = "difficulty_score" if sort_dir == "asc" else "-difficulty_score"
+        results_qs = results_qs.order_by(difficulty_order, "-searched_at")
+    elif sort_by == "country":
+        country_order = "country" if sort_dir == "asc" else "-country"
+        results_qs = results_qs.order_by(country_order, "-searched_at")
+    elif sort_by == "competitors":
+        sorted_results = list(results_qs)
+        sorted_results.sort(
+            key=lambda result: (
+                len(result.competitors_data or []),
+                -result.searched_at.timestamp(),
+            )
+            if sort_dir == "asc"
+            else (
+                -len(result.competitors_data or []),
+                -result.searched_at.timestamp(),
+            )
+        )
+    else:
+        date_order = "searched_at" if sort_dir == "asc" else "-searched_at"
+        results_qs = results_qs.order_by(date_order)
 
     # Count unique keywords for the toolbar
     keyword_qs = Keyword.objects.all()
@@ -103,11 +181,14 @@ def dashboard_view(request):
         page = 1
 
     per_page = 25
-    total_count = results_qs.count()
+    total_count = len(sorted_results) if sorted_results is not None else results_qs.count()
     total_pages = max(1, (total_count + per_page - 1) // per_page)
     page = min(page, total_pages)
     start = (page - 1) * per_page
-    history_results = list(results_qs[start : start + per_page])
+    if sorted_results is not None:
+        history_results = sorted_results[start : start + per_page]
+    else:
+        history_results = list(results_qs[start : start + per_page])
 
     # Annotate each result with trend data (previous result comparison)
     for result in history_results:
@@ -147,16 +228,6 @@ def dashboard_view(request):
             result.difficulty_delta = None
             result.rank_delta = None
 
-    # Show rank column when filtering by an app that has a track_id
-    show_rank = False
-    selected_app_name = None
-    if app_id:
-        selected_app_obj = App.objects.filter(id=app_id).first()
-        if selected_app_obj:
-            selected_app_name = selected_app_obj.name
-            if selected_app_obj.track_id:
-                show_rank = True
-
     return render(
         request,
         "aso/dashboard.html",
@@ -176,6 +247,8 @@ def dashboard_view(request):
             "total_count": total_count,
             "has_prev": page > 1,
             "has_next": page < total_pages,
+            "current_sort": sort_by,
+            "current_dir": sort_dir,
         },
     )
 
@@ -229,11 +302,6 @@ def search_view(request):
     for country in countries:
         country_results = []
         for kw_text in keywords:
-            # Rate limit between API calls
-            if call_count > 0:
-                time.sleep(2)
-            call_count += 1
-
             # Get or create keyword
             keyword_obj, created = Keyword.objects.get_or_create(
                 keyword=kw_text.lower(),
@@ -247,6 +315,11 @@ def search_view(request):
             ).exists():
                 skipped.append(f"{kw_text} ({country.upper()})")
                 continue
+
+            # Rate limit between external iTunes API calls only.
+            if call_count > 0:
+                time.sleep(2)
+            call_count += 1
 
             # iTunes Search
             competitors = itunes_service.search_apps(kw_text, country=country, limit=25)
