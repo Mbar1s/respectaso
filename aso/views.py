@@ -340,7 +340,10 @@ def search_view(request):
             popularity = popularity_est.estimate(competitors, kw_text)
 
             # Download estimates
-            download_estimates = download_est.estimate(popularity or 0, len(competitors))
+            download_estimates = download_est.estimate(
+                popularity or 0,
+                country=country,
+            )
             breakdown["download_estimates"] = download_estimates
 
             # Save result (one entry per keyword+country per day)
@@ -462,7 +465,10 @@ def opportunity_search_view(request):
         )
         popularity = popularity_est.estimate(competitors, kw_text)
 
-        download_estimates = download_est.estimate(popularity or 0, len(competitors))
+        download_estimates = download_est.estimate(
+            popularity or 0,
+            country=country_code,
+        )
         breakdown["download_estimates"] = download_estimates
 
         app_rank = None
@@ -762,7 +768,10 @@ def keyword_refresh_view(request, keyword_id):
     popularity = popularity_est.estimate(competitors, keyword_obj.keyword)
 
     # Download estimates
-    download_estimates = download_est.estimate(popularity or 0, len(competitors))
+    download_estimates = download_est.estimate(
+        popularity or 0,
+        country=country,
+    )
     breakdown["download_estimates"] = download_estimates
 
     # Save new result (one entry per keyword+country per day)
@@ -883,7 +892,10 @@ def keywords_bulk_refresh_view(request):
         popularity = popularity_est.estimate(competitors, kw.keyword)
 
         # Download estimates
-        download_estimates = download_est.estimate(popularity or 0, len(competitors))
+        download_estimates = download_est.estimate(
+            popularity or 0,
+            country=country,
+        )
         breakdown["download_estimates"] = download_estimates
 
         search_result = SearchResult.upsert_today(

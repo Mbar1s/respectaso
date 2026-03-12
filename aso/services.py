@@ -8,12 +8,214 @@ server is involved.
 
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+_FINANCE_INTENT_TOKENS = {
+    "option",
+    "options",
+    "trading",
+    "trade",
+    "stock",
+    "stocks",
+    "call",
+    "put",
+    "signal",
+    "signals",
+    "invest",
+    "investing",
+}
+
+_FINANCE_STRONG_CONTEXT_TOKENS = {
+    "finance",
+    "financial",
+    "stock",
+    "stocks",
+    "trading",
+    "trade",
+    "portfolio",
+    "broker",
+    "invest",
+    "investing",
+    "market",
+    "markets",
+    "futures",
+    "derivative",
+    "derivatives",
+    "forex",
+    "etf",
+}
+
+_TOKEN_NORMALIZATION = {
+    "options": "option",
+    "stocks": "stock",
+    "signals": "signal",
+    "markets": "market",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize into lowercase alphanumeric words for robust title matching."""
+    raw_tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [_TOKEN_NORMALIZATION.get(tok, tok) for tok in raw_tokens]
+
+
+def _has_finance_intent(keyword_tokens: set[str]) -> bool:
+    return bool(keyword_tokens & _FINANCE_INTENT_TOKENS)
+
+
+def _has_finance_context(title_tokens: set[str], genre: str) -> bool:
+    genre_lower = (genre or "").lower()
+    if "finance" in genre_lower:
+        return True
+    if title_tokens & _FINANCE_STRONG_CONTEXT_TOKENS:
+        return True
+    return False
+
+
+def _keyword_title_evidence(keyword: str, title: str, genre: str = "") -> dict[str, float | bool]:
+    """
+    Match hierarchy: exact phrase > all words(any order) > partial overlap(weak).
+
+    Returns a normalized evidence score in [0, 1] plus match flags.
+    """
+    kw = (keyword or "").lower().strip()
+    title_lower = (title or "").lower()
+    kw_tokens = set(_tokenize(kw))
+    title_tokens_list = _tokenize(title_lower)
+    title_tokens = set(title_tokens_list)
+
+    if not kw_tokens or not title_tokens:
+        return {
+            "exact_phrase": False,
+            "all_words": False,
+            "partial_overlap": 0.0,
+            "proximity": 0.0,
+            "evidence": 0.0,
+        }
+
+    exact_phrase = bool(kw and kw in title_lower)
+    all_words = all(tok in title_tokens for tok in kw_tokens)
+    overlap = len(kw_tokens & title_tokens) / len(kw_tokens)
+
+    # Proximity rewards compact all-word matches while still accepting
+    # reverse order and words-in-between as strong evidence.
+    proximity = 0.0
+    if all_words and len(kw_tokens) > 1:
+        positions = []
+        for token in kw_tokens:
+            for idx, title_token in enumerate(title_tokens_list):
+                if title_token == token:
+                    positions.append(idx)
+                    break
+        if positions:
+            span = max(1, max(positions) - min(positions) + 1)
+            proximity = min(1.0, len(kw_tokens) / span)
+
+    # Ambiguity guard: finance-intent keywords should not get strong
+    # relevance from non-finance titles (e.g. generic "call" apps).
+    finance_intent = _has_finance_intent(kw_tokens)
+    finance_context = _has_finance_context(title_tokens, genre)
+    if finance_intent and not finance_context and (exact_phrase or all_words):
+        exact_phrase = False
+        all_words = False
+        overlap = min(overlap, 0.5)
+    if finance_intent and not finance_context and not (exact_phrase or all_words):
+        overlap = 0.0
+
+    strong_score = 0.0
+    if exact_phrase:
+        strong_score = 1.0
+    elif all_words:
+        strong_score = 0.85 + 0.15 * proximity
+
+    partial_score = 0.0
+    if not exact_phrase and not all_words and overlap > 0:
+        partial_score = min(0.5, overlap * 0.5)
+
+    return {
+        "exact_phrase": exact_phrase,
+        "all_words": all_words,
+        "partial_overlap": overlap,
+        "proximity": proximity,
+        "evidence": max(strong_score, partial_score),
+    }
+
+
+def _is_brand_keyword(
+    keyword: str, leader: dict, competitors: list[dict],
+) -> tuple[bool, str | None]:
+    """
+    Detect whether a keyword is a brand/company name.
+
+    Uses signals from the search results (no dictionary needed):
+
+    Signal A — Seller name match (required):
+        All keyword tokens appear in the #1 app's sellerName.
+        e.g. "spotify" ∈ ["spotify", "ab"] → match.
+        e.g. "nasdaq" ∈ ["nasdaq", "inc"] → match.
+        e.g. "stocks" ∉ ["apple", "inc"] → no match.
+
+    Signal B — Review disparity (required only for weak leaders):
+        When the leader has < 1,000 reviews, also require that
+        positions #2-5 have a median ≥ 10,000 reviews.  This
+        confirms the weak leader is an Apple rank-boost, not a
+        genuinely weak keyword.
+
+    For strong leaders (≥ 1,000 reviews), Signal A alone is
+    sufficient — a well-established app whose seller matches the
+    keyword IS the brand (e.g. Spotify with 39M reviews).
+
+    Returns:
+        (is_brand, brand_name) — brand_name is the sellerName when
+        detected, None otherwise.
+    """
+    kw_tokens = set(_tokenize(keyword))
+    if not kw_tokens:
+        return False, None
+
+    seller = leader.get("sellerName", "")
+    seller_tokens = set(_tokenize(seller))
+    if not seller_tokens:
+        return False, None
+
+    # Signal A: every keyword token appears in the seller name
+    if not kw_tokens.issubset(seller_tokens):
+        return False, None
+
+    # For strong leaders, seller-name match alone is definitive.
+    leader_reviews = leader.get("userRatingCount", 0)
+    if leader_reviews >= 1_000:
+        return True, seller
+
+    # Signal B: weak leader — also require strong field behind it
+    # to confirm Apple rank-boosted the brand app.
+    # Exclude same-seller apps (brand's own portfolio) from runner-up
+    # assessment — they don't represent independent competition.
+    leader_seller_lower = seller.strip().lower()
+    independent = [
+        c for c in competitors[1:]
+        if c.get("sellerName", "").strip().lower() != leader_seller_lower
+    ][:4]
+    if not independent:
+        return False, None
+    runner_reviews = sorted(c.get("userRatingCount", 0) for c in independent)
+    n_ru = len(runner_reviews)
+    if n_ru % 2 == 1:
+        median_ru = runner_reviews[n_ru // 2]
+    else:
+        median_ru = (runner_reviews[n_ru // 2 - 1] + runner_reviews[n_ru // 2]) / 2
+
+    if median_ru < 10_000:
+        return False, None
+
+    return True, seller
 
 
 # --------------------------------------------------------------------------- #
@@ -103,16 +305,21 @@ class PopularityEstimator:
                 leader_score = 30
 
         # Signal 3: Title match density (0–20 points)
-        # Apps with keyword in title = developers targeting it = demand
-        kw_words = set(kw_lower.split()) if kw_lower else set()
+        # Strong title targeting (exact/all-word) is demand evidence.
         title_matches = 0
         exact_phrase_matches = 0
+        relevance_sum = 0.0
         for c in competitors:
-            title = c.get("trackName", "").lower()
-            if kw_lower and kw_lower in title:
+            evidence = _keyword_title_evidence(
+                kw_lower,
+                c.get("trackName", ""),
+                c.get("primaryGenreName", ""),
+            )
+            relevance_sum += float(evidence["evidence"])
+            if evidence["exact_phrase"]:
                 title_matches += 1
                 exact_phrase_matches += 1
-            elif kw_words and all(w in title for w in kw_words):
+            elif evidence["all_words"]:
                 title_matches += 1
         match_ratio = title_matches / n if n > 0 else 0
         title_score = min(20, match_ratio * 40)
@@ -204,21 +411,9 @@ class PopularityEstimator:
         # is padding results with unrelated apps.  The high result
         # count is artificial and shouldn’t count at full weight.
         #
-        # For multi-word keywords, use word-overlap (≥50% of words)
-        # instead of requiring all words.  "CollX: Sports Card Scanner"
-        # is a real competitor for "value card scanner" (2/3 words)
-        # even though it lacks "value".
-        if len(kw_words) > 1:
-            relevant_count = 0
-            min_overlap = max(1, len(kw_words) * 0.5)
-            for c in competitors:
-                title_words = set(c.get("trackName", "").lower().split())
-                if len(kw_words & title_words) >= min_overlap:
-                    relevant_count += 1
-            relevance_ratio = relevant_count / n if n > 0 else 0
-        else:
-            relevance_ratio = match_ratio  # single-word: strict match
-        relevance = max(0.3, min(1.0, relevance_ratio * 3))
+        # Partial overlap is allowed only as weak evidence.
+        relevance_ratio = relevance_sum / n if n > 0 else 0
+        relevance = max(0.3, min(1.0, relevance_ratio * 2.6))
         result_score *= relevance
         leader_score *= relevance
         depth_score *= relevance
@@ -380,60 +575,143 @@ class DownloadEstimator:
     # Calibrated against real App Store data.
     # Apple does not publish search volumes; these are conservative
     # estimates cross-checked with real download / rank observations.
-    # Anchor: popularity 68, rank #8  →  ~8-10 organic downloads/day.
+    # Anchor: popularity 68, rank #8  →  low single-digit downloads/day
+    # for early-stage apps in competitive categories.
+    #
+    # The growth rate accelerates above pop 75 because Apple's
+    # popularity scale is roughly logarithmic — each point at
+    # the top represents a much larger absolute search increment
+    # than at the bottom.
     _POP_TO_SEARCHES = [
         # (popularity, daily_searches)
         (5, 1),
-        (10, 2),
+        (10, 3),
         (15, 5),
         (20, 10),
         (25, 20),
         (30, 35),
-        (35, 60),
-        (40, 100),
-        (45, 170),
-        (50, 300),
-        (55, 480),
-        (60, 700),
-        (65, 1_000),
-        (70, 1_500),
-        (75, 2_500),
-        (80, 4_000),
-        (85, 6_500),
-        (90, 10_000),
+        (35, 55),
+        (40, 90),
+        (45, 140),
+        (50, 200),
+        (55, 290),
+        (60, 400),
+        (65, 550),
+        (70, 750),
+        (75, 1_100),
+        (80, 2_000),
+        (85, 4_000),
+        (90, 8_000),
         (95, 16_000),
-        (100, 25_000),
+        (100, 32_000),
     ]
 
     # Position → tap-through rate (fraction of searchers who tap).
-    # Based on App Store search behavior studies.  Drops sharply
-    # after position 1, then decays more gradually.
+    #
+    # App Store search shows 2–3 full app cards per screen (icon,
+    # title, subtitle, screenshots, GET button).  Position #1 is
+    # always fully visible and dominates attention.
+    #
+    # References:
+    #   - Apple Search Ads average TTR ~7.5 % for *paid* placements;
+    #     organic #1 should be well above that.
+    #   - Google web-search #1 CTR is 27–32 % with plain text links;
+    #     App Store's visual cards give #1 even more prominence.
+    #   - ASO industry studies (Phiture, StoreMaven) report 25–50 %
+    #     engagement for the top organic result.
+    #
+    # Decay follows a power-law: steep drop from #1 to #5 (all on
+    # first screen), then gradual tail for positions requiring scroll.
     _TTR = {
         1: 0.30,
-        2: 0.15,
-        3: 0.10,
-        4: 0.07,
-        5: 0.05,
-        6: 0.035,
-        7: 0.025,
-        8: 0.018,
-        9: 0.013,
-        10: 0.010,
-        11: 0.007,
-        12: 0.005,
-        13: 0.004,
-        14: 0.003,
-        15: 0.0025,
-        16: 0.002,
-        17: 0.0015,
-        18: 0.001,
-        19: 0.0008,
-        20: 0.0006,
+        2: 0.18,
+        3: 0.12,
+        4: 0.085,
+        5: 0.060,
+        6: 0.045,
+        7: 0.033,
+        8: 0.025,
+        9: 0.019,
+        10: 0.013,
+        11: 0.009,
+        12: 0.007,
+        13: 0.0055,
+        14: 0.0042,
+        15: 0.0033,
+        16: 0.0025,
+        17: 0.0019,
+        18: 0.0014,
+        19: 0.0010,
+        20: 0.0007,
     }
 
-    # Conversion rate (tap → install): range for free apps
-    _CVR_LOW = 0.35
-    _CVR_HIGH = 0.55
+    # Conversion rate (tap → install): range for free apps.
+    #
+    # Low end (5 %): unknown indie app, weak listing, few ratings.
+    # High end (20 %): category leader, strong brand, 100 K+ ratings.
+    _CVR_LOW = 0.05
+    _CVR_HIGH = 0.20
+
+    # Market-size multiplier: scales search volumes relative to US.
+    # _POP_TO_SEARCHES is calibrated for the US App Store (~180 M iPhones).
+    # Smaller markets have proportionally fewer searches for the same
+    # popularity score.  Factors derived from estimated active-iPhone
+    # installed base per country relative to the US.
+    _MARKET_SIZE = {
+        "us": 1.0,
+        # Tier 2 — large markets (30 M+ iPhones)
+        "cn": 0.45,
+        "jp": 0.35,
+        "gb": 0.30,
+        "de": 0.25,
+        "fr": 0.22,
+        "kr": 0.20,
+        "br": 0.18,
+        "in": 0.15,
+        "ca": 0.15,
+        "au": 0.12,
+        "ru": 0.12,
+        "it": 0.12,
+        "es": 0.10,
+        "mx": 0.10,
+        # Tier 3 — mid-size markets (5–30 M iPhones)
+        "tw": 0.08,
+        "nl": 0.07,
+        "se": 0.06,
+        "ch": 0.06,
+        "pl": 0.05,
+        "tr": 0.05,
+        "th": 0.05,
+        "id": 0.05,
+        "be": 0.04,
+        "at": 0.04,
+        "no": 0.04,
+        "dk": 0.04,
+        "sg": 0.04,
+        "il": 0.04,
+        "ae": 0.04,
+        "sa": 0.04,
+        "ph": 0.04,
+        "my": 0.04,
+        "za": 0.03,
+        "ie": 0.03,
+        "fi": 0.03,
+        "pt": 0.03,
+        "nz": 0.03,
+        "cl": 0.03,
+        "ar": 0.03,
+        "co": 0.03,
+        "ng": 0.03,
+        "eg": 0.03,
+        "pk": 0.02,
+        "ke": 0.02,
+        "gh": 0.02,
+        "tz": 0.02,
+        "ug": 0.02,
+    }
+    _MARKET_SIZE_DEFAULT = 0.03
+
+
 
     def _daily_searches(self, popularity: int) -> float:
         """Interpolate daily search volume from popularity score."""
@@ -453,10 +731,14 @@ class DownloadEstimator:
         return pts[-1][1]
 
     def estimate(
-        self, popularity: int, result_count: int = 25
+        self,
+        popularity: int,
+        country: str = "us",
     ) -> dict:
         """
         Estimate daily downloads for each position 1–20.
+
+        Model: Downloads = Searches × TTR(position) × CVR
 
         Returns dict with:
           - daily_searches: estimated daily searches for this keyword
@@ -466,16 +748,22 @@ class DownloadEstimator:
         """
         searches = self._daily_searches(popularity)
 
+        # Scale search volume by relative App Store market size.
+        market_mult = self._MARKET_SIZE.get(
+            (country or "us").lower(), self._MARKET_SIZE_DEFAULT
+        )
+        searches *= market_mult
+
         positions = []
         for pos in range(1, 21):
-            ttr = self._TTR.get(pos, 0.002)
+            ttr = self._TTR.get(pos, 0.001)
             dl_low = searches * ttr * self._CVR_LOW
             dl_high = searches * ttr * self._CVR_HIGH
             positions.append({
                 "pos": pos,
                 "ttr": round(ttr * 100, 2),
-                "downloads_low": round(dl_low),
-                "downloads_high": round(dl_high),
+                "downloads_low": round(dl_low, 2),
+                "downloads_high": round(dl_high, 2),
             })
 
         # Tier summaries (average daily downloads across positions in tier)
@@ -484,8 +772,8 @@ class DownloadEstimator:
             if not subset:
                 return {"low": 0, "high": 0}
             return {
-                "low": round(sum(p["downloads_low"] for p in subset) / len(subset)),
-                "high": round(sum(p["downloads_high"] for p in subset) / len(subset)),
+                "low": round(sum(p["downloads_low"] for p in subset) / len(subset), 2),
+                "high": round(sum(p["downloads_high"] for p in subset) / len(subset), 2),
             }
 
         tiers = {
@@ -495,7 +783,7 @@ class DownloadEstimator:
         }
 
         return {
-            "daily_searches": round(searches),
+            "daily_searches": round(searches, 2),
             "positions": positions,
             "tiers": tiers,
         }
@@ -657,13 +945,19 @@ class DifficultyCalculator:
         publisher_diversity = min(100, (unique_publishers / max(n, 1)) * 100)
 
         # --- Title Relevance (10%) — 0-100 normalized ---
+        # Strong match only: exact phrase or all words(any order).
         title_match_count = 0
-        kw_words = set(kw_lower.split()) if kw_lower else set()
+        relevance_sum = 0.0
         for c in competitors:
-            title = c.get("trackName", "").lower()
-            if kw_lower and kw_lower in title:
+            evidence = _keyword_title_evidence(
+                kw_lower,
+                c.get("trackName", ""),
+                c.get("primaryGenreName", ""),
+            )
+            relevance_sum += float(evidence["evidence"])
+            if evidence["exact_phrase"]:
                 title_match_count += 1
-            elif kw_words and all(w in title for w in kw_words):
+            elif evidence["all_words"]:
                 title_match_count += 1
         title_relevance = min(100, (title_match_count / max(n, 1)) * 100)
 
@@ -689,25 +983,11 @@ class DifficultyCalculator:
         # computed on irrelevant apps are misleading (e.g. high
         # publisher diversity from 11 random unrelated apps).
         #
-        # For multi-word keywords, use word-overlap (≥50% of words)
-        # instead of requiring all words.  "CollX: Sports Card Scanner"
-        # is a real competitor for "value card scanner" (2/3 words)
-        # even though it lacks "value".
-        #
         # ALWAYS applied (including tiers): if most apps in a slice
         # are backfill, their sub-scores are inflated regardless of
         # whether the slice is intentional.
-        if len(kw_words) > 1:
-            relevant_count = 0
-            min_overlap = max(1, len(kw_words) * 0.5)
-            for c in competitors:
-                title_words = set(c.get("trackName", "").lower().split())
-                if len(kw_words & title_words) >= min_overlap:
-                    relevant_count += 1
-            relevance_ratio = relevant_count / n if n > 0 else 0
-        else:
-            relevance_ratio = title_match_count / max(n, 1)
-        relevance = max(0.3, min(1.0, relevance_ratio * 3))
+        relevance_ratio = relevance_sum / max(n, 1)
+        relevance = max(0.3, min(1.0, relevance_ratio * 2.6))
         publisher_diversity *= relevance
         rating_quality *= relevance
         market_age *= relevance
@@ -807,6 +1087,16 @@ class DifficultyCalculator:
         leader_reviews = competitors[0].get("userRatingCount", 0) if competitors else 0
         match_ratio = title_match_count / n if n > 0 else 0
 
+        # Brand keyword detection: skip weak-leader adjustments when
+        # the keyword matches the #1 app's publisher (e.g. "nasdaq"
+        # → Nasdaq, Inc.). The competitors aren't backfill — Apple
+        # ranked them intentionally for this brand query.
+        is_brand_keyword, brand_name = (
+            _is_brand_keyword(kw_lower, competitors[0], competitors)
+            if competitors and kw_lower
+            else (False, None)
+        )
+
         # Signal 0: Small Result Set Cap
         # If Apple returns very few results, there's objectively little
         # competition for this keyword regardless of how strong those
@@ -814,12 +1104,13 @@ class DifficultyCalculator:
         # relevance become statistically meaningless with tiny samples.
         #
         # Smooth curve instead of step function:
-        #   cap = 12 * n^0.85  →  1→12, 2→22, 3→31, 4→40, 5→48
-        # Tapers off naturally; no cliff between n=3 and n=4.
-        # Only applies when n ≤ 5 (above that, enough data to trust
-        # the raw score).
-        if n <= 5:
-            small_cap = int(12 * (n ** 0.85))
+        # Explicit caps keep tiny samples from looking competitive
+        # while preserving moderate markets at n=5.
+        #   n=1→10, n=2→20, n=3→31, n=4→40
+        # Only applies when n ≤ 4 (n=5 keeps the raw score).
+        small_caps = {1: 10, 2: 20, 3: 31, 4: 40}
+        if n in small_caps:
+            small_cap = small_caps[n]
             if total > small_cap:
                 total = small_cap
                 override_reason = "small_result_set"
@@ -836,7 +1127,7 @@ class DifficultyCalculator:
             #   100 → 39, 500 → 47, 999 → 50
             # Only applies when leader < 1000; above that no cap.
             leader_cap = None
-            if leader_reviews < 1_000:
+            if leader_reviews < 1_000 and not is_brand_keyword:
                 leader_cap = int(
                     15 + 35 * math.log10(leader_reviews + 1) / math.log10(1001)
                 )
@@ -866,7 +1157,7 @@ class DifficultyCalculator:
             # So match_ratio=0 → 0.6×, 0.1 → 0.8×, 0.2 → 1.0× (no discount).
             # Leader strength further modulates: stronger leaders
             # mean less discount via log interpolation.
-            if match_ratio < 0.2 and leader_reviews < 1_000:
+            if match_ratio < 0.2 and leader_reviews < 1_000 and not is_brand_keyword:
                 # Base discount from match ratio (smooth ramp)
                 ratio_factor = min(1.0, 0.6 + 2.0 * match_ratio)
                 # Leader strength factor: stronger leaders = less discount
@@ -908,6 +1199,24 @@ class DifficultyCalculator:
             n,
             avg_quality,
         )
+
+        # Add brand keyword insight (even when score is NOT adjusted)
+        if is_brand_keyword:
+            leader_name = competitors[0].get("trackName", "#1 app")
+            insights.insert(
+                0,
+                {
+                    "icon": "🏷️",
+                    "type": "info",
+                    "text": (
+                        f"Brand keyword — '{kw_lower}' matches publisher "
+                        f"{brand_name}. The #1 app ({leader_name}) has few "
+                        f"reviews because it's a brand companion app, not "
+                        f"because the keyword is easy. Difficulty reflects "
+                        f"the full competitive landscape."
+                    ),
+                },
+            )
 
         # Add override insight at the top if score was adjusted
         if override_reason and raw_total != total:
@@ -989,12 +1298,15 @@ class DifficultyCalculator:
             overall_score=total,
             overall_match_ratio=match_ratio,
             overall_leader_reviews=leader_reviews,
+            is_brand_keyword=is_brand_keyword,
         )
 
         breakdown = {
             "total_score": total,
             "raw_total": raw_total,
             "override_reason": override_reason,
+            "is_brand_keyword": is_brand_keyword,
+            "brand_name": brand_name,
             "rating_volume": sub_scores["rating_volume"],
             "review_velocity": sub_scores["review_velocity"],
             "dominant_players": sub_scores["dominant_players"],
@@ -1020,6 +1332,7 @@ class DifficultyCalculator:
         overall_score: int = 0,
         overall_match_ratio: float = 0.0,
         overall_leader_reviews: int = 0,
+        is_brand_keyword: bool = False,
     ) -> dict:
         """
         Compute ranking tier analysis for Top 5, Top 10, and Top 20.
@@ -1082,7 +1395,7 @@ class DifficultyCalculator:
             if kw_lower and full_n >= 2:
                 # Weak leader cap (based on overall leader)
                 tier_cap = None
-                if overall_leader_reviews < 1_000:
+                if overall_leader_reviews < 1_000 and not is_brand_keyword:
                     tier_cap = int(
                         15 + 35 * math.log10(overall_leader_reviews + 1) / math.log10(1001)
                     )
@@ -1096,7 +1409,7 @@ class DifficultyCalculator:
                         tier_score = tier_cap
 
                 # Backfill discount (based on overall match ratio)
-                if overall_match_ratio < 0.2 and overall_leader_reviews < 1_000:
+                if overall_match_ratio < 0.2 and overall_leader_reviews < 1_000 and not is_brand_keyword:
                     ratio_factor = min(1.0, 0.6 + 2.0 * overall_match_ratio)
                     leader_factor = math.log10(overall_leader_reviews + 1) / math.log10(1001)
                     discount = ratio_factor + (1.0 - ratio_factor) * leader_factor
